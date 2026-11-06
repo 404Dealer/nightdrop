@@ -188,4 +188,4 @@ security:
   enforceProductionPermissions: true
 ```
 
-Nightdrop will fail closed at startup if the write-only inbox or private state directories are misconfigured.
+Nightdrop fails closed at startup when queue path types, required modes, service ownership, or the root-owned draft parent are wrong.

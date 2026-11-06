@@ -297,7 +297,7 @@ sudo systemctl status nightdrop --no-pager
 sudo journalctl -u nightdrop -f
 ```
 
-With `security.enforceProductionPermissions: true`, startup fails closed if the draft directories do not match the production isolation model. A healthy startup logs:
+With `security.enforceProductionPermissions: true`, startup fails closed unless queue path types, required modes, service UID/GID ownership of the inbox and private state directories, and the root-owned draft parent match the production isolation model. A healthy startup logs:
 
 ```text
 ✅ Draft directory isolation checks passed.
@@ -339,7 +339,7 @@ sg nightdrop-inbox -c 'cat > /opt/nightdrop/drafts/inbox/my-draft.json << EOF
 EOF'
 ```
 
-The file lands in the dropbox. Nightdrop picks it up, moves it to `pending/`, and sends you a Telegram preview. Your agent never sees it again.
+The file lands in the dropbox. Nightdrop captures a bounded snapshot into a new exclusive `0600` service-owned inode under `pending/`, then conditionally removes the same unchanged inbox entry and sends a Telegram preview. The detached pending copy remains authoritative even if inbox cleanup fails. The agent cannot modify the claimed copy, even if it retained a hard link or an open file descriptor to its original inode.
 
 ## Verifying Isolation
 

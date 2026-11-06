@@ -1,13 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdir, rm, writeFile, chmod, stat } from 'node:fs/promises';
+import { once } from 'node:events';
+import { chmod, link, mkdir, open, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { buildApprovalPreview, createApprovalToken, sha256hex } from '../src/bot.js';
 import { verifyDraftDirectoryIsolation } from '../src/security.js';
 import { DraftSchema } from '../src/schema.js';
+import { DraftWatcher, type DraftEvent } from '../src/watcher.js';
 
 const emailDraft = (body = 'hello') => DraftSchema.parse({
   id: randomUUID(),
@@ -114,12 +116,172 @@ test('production isolation verifier accepts a write-only inbox and private state
 
     const mode = (await stat(inbox)).mode & 0o7777;
     assert.equal(mode, 0o1730);
-    const result = await verifyDraftDirectoryIsolation({ rootDir: root, inboxDir: inbox });
+    const result = await verifyDraftDirectoryIsolation({
+      rootDir: root,
+      inboxDir: inbox,
+      expectedRootUid: process.getuid?.() ?? 0
+    });
     assert.equal(result.ok, true, result.errors.join('\n'));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('production isolation verifier rejects state not owned by the service identity', async () => {
+  const root = await mktempDir();
+  try {
+    const inbox = join(root, 'inbox');
+    await mkdir(inbox, { recursive: true });
+    for (const dir of ['pending', 'approved', 'sent', 'denied', 'failed']) {
+      await mkdir(join(root, dir), { recursive: true });
+      await chmod(join(root, dir), 0o700);
+    }
+    await chmod(root, 0o750);
+    await chmod(inbox, 0o1730);
+
+    const currentUid = process.getuid?.() ?? 0;
+    const result = await verifyDraftDirectoryIsolation({
+      rootDir: root,
+      inboxDir: inbox,
+      expectedServiceUid: currentUid + 1,
+      expectedRootUid: currentUid
+    });
+    assert.equal(result.ok, false);
+    assert(result.errors.some((error) => error.includes('service UID')));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('production isolation verifier treats a missing draft-root stat as an error', async () => {
+  const parent = await mktempDir();
+  const root = join(parent, 'missing-root');
+  try {
+    const result = await verifyDraftDirectoryIsolation({ rootDir: root, inboxDir: join(root, 'inbox') });
+    assert.equal(result.ok, false);
+    assert(result.errors.some((message) => message.includes('Cannot stat draft root')));
+    assert.equal(result.warnings.some((message) => message.includes('Cannot stat draft root')), false);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test('watcher detaches an agent-owned hard-linked inode before exposing pending state', async () => {
+  const root = await mktempDir();
+  const watcher = new DraftWatcher({ rootDir: root, inboxDir: join(root, 'inbox'), pollIntervalMs: 20 });
+  try {
+    const inbox = join(root, 'inbox');
+    await mkdir(inbox, { recursive: true });
+    await watcher.start();
+    await settleWatcher();
+
+    const sourcePath = join(root, 'agent-retained-link.json');
+    const inboxPath = join(inbox, 'draft.json');
+    const original = emailDraft('approved content');
+    const replacement = emailDraft('agent changed retained hard link');
+    await writeFile(sourcePath, JSON.stringify(original), { encoding: 'utf8', mode: 0o640 });
+
+    const draftEvent = once(watcher, 'draft') as Promise<[DraftEvent]>;
+    await link(sourcePath, inboxPath);
+    const [event] = await draftEvent;
+    await writeFile(sourcePath, JSON.stringify(replacement), 'utf8');
+
+    const pendingPath = join(root, 'pending', 'draft.json');
+    const pendingRaw = await readFile(pendingPath, 'utf8');
+    const pendingStat = await stat(pendingPath);
+    const retainedStat = await stat(sourcePath);
+    const pendingDraft = DraftSchema.parse(JSON.parse(pendingRaw));
+    assert.equal(event.draft.type, 'email');
+    assert.equal(pendingDraft.type, 'email');
+    if (event.draft.type !== 'email' || pendingDraft.type !== 'email') {
+      throw new Error('Expected email drafts');
+    }
+    assert.equal(
+      'body' in event.draft.payload ? event.draft.payload.body : undefined,
+      'approved content'
+    );
+    assert.equal(
+      'body' in pendingDraft.payload ? pendingDraft.payload.body : undefined,
+      'approved content'
+    );
+    assert.notEqual(pendingStat.ino, retainedStat.ino);
+    assert.equal(pendingStat.mode & 0o777, 0o600);
+  } finally {
+    await watcher.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('watcher detaches pending state from a submitter that keeps the inbox file open', async () => {
+  const root = await mktempDir();
+  const inbox = join(root, 'inbox');
+  const watcher = new DraftWatcher({ rootDir: root, inboxDir: inbox, pollIntervalMs: 20 });
+  try {
+    await mkdir(inbox, { recursive: true });
+    await watcher.start();
+    await settleWatcher();
+
+    const stagedPath = join(root, 'agent-staged.json');
+    const inboxPath = join(inbox, 'held-open.json');
+    const original = JSON.stringify(emailDraft('approved content'));
+    const replacement = JSON.stringify(emailDraft('agent rewrote through retained descriptor'));
+    await writeFile(stagedPath, original, { encoding: 'utf8', mode: 0o666 });
+    // Hold a writable descriptor on the submitted inode, then publish it complete.
+    const handle = await open(stagedPath, 'r+');
+    try {
+      const draftEvent = Promise.race([
+        once(watcher, 'draft'),
+        once(watcher, 'malformed').then(([event]) => {
+          throw new Error(`unexpected malformed event: ${(event as { error: string }).error}`);
+        })
+      ]);
+      await link(stagedPath, inboxPath);
+      await rm(stagedPath);
+      await draftEvent;
+      await handle.truncate(0);
+      await handle.write(replacement, 0, 'utf8');
+    } finally {
+      await handle.close();
+    }
+
+    const pendingDraft = DraftSchema.parse(JSON.parse(await readFile(join(root, 'pending', 'held-open.json'), 'utf8')));
+    if (pendingDraft.type !== 'email') throw new Error('Expected email draft');
+    assert.equal('body' in pendingDraft.payload ? pendingDraft.payload.body : undefined, 'approved content');
+  } finally {
+    await watcher.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('watcher preserves malformed inbox source when failure evidence cannot be created', async () => {
+  const root = await mktempDir();
+  const inbox = join(root, 'inbox');
+  const watcher = new DraftWatcher({ rootDir: root, inboxDir: inbox, pollIntervalMs: 20 });
+  try {
+    await mkdir(inbox, { recursive: true });
+    await watcher.start();
+    await settleWatcher();
+    const failedPath = join(root, 'failed', 'malformed.json');
+    const inboxPath = join(inbox, 'malformed.json');
+    await writeFile(failedPath, 'existing failure evidence', 'utf8');
+    await writeFile(inboxPath, '{not-json', 'utf8');
+    await new Promise((resolveWait) => setTimeout(resolveWait, 1_000));
+
+    assert.equal(await readFile(inboxPath, 'utf8'), '{not-json');
+    assert.equal(await readFile(failedPath, 'utf8'), 'existing failure evidence');
+    await assert.rejects(stat(join(root, 'pending', 'malformed.json')), { code: 'ENOENT' });
+  } finally {
+    await watcher.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// chokidar's polling baseline is armed shortly after 'ready'; a file created in that
+// gap is only noticed on the next directory change, which made fresh per-test
+// watchers miss their single submission when several ran in one process.
+async function settleWatcher(): Promise<void> {
+  await new Promise((resolveWait) => setTimeout(resolveWait, 250));
+}
 
 async function mktempDir(): Promise<string> {
   return await import('node:fs/promises').then(({ mkdtemp }) => mkdtemp(join(tmpdir(), 'nightdrop-test-')));
