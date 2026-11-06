@@ -42,11 +42,11 @@ Nightdrop is only a **hard security boundary** when these requirements are true:
 | Requirement | Why it matters |
 |-------------|----------------|
 | Nightdrop runs as a separate OS user | Prevents the AI agent process from reading/modifying pending or approved drafts |
-| The agent has write-only access to the inbox | The agent can propose drafts but cannot list, read, edit, delete, or replace drafts after submission |
+| The agent has dropbox access to the inbox | The agent cannot enumerate the inbox or access service-claimed `pending/` state. It still controls its own known inode until Nightdrop captures a detached private copy; removal of the unchanged inbox entry is a separate best-effort cleanup step. |
 | Send credentials live only in Nightdrop | If the agent also has SMTP, Gmail, Outlook, or Zoho send credentials, it can bypass the gate |
 | The approval bot token is not available to the agent | Prevents the agent from approving its own drafts |
 | Gmail/Outlook mailbox access is exposed only through the bounded Unix-socket broker | Keeps Gmail App Passwords, Outlook OAuth tokens, arbitrary IMAP commands, and unrestricted Graph calls outside the agent process |
-| `security.enforceProductionPermissions: true` in production | Fails closed if the write-only inbox/private state directories are misconfigured |
+| `security.enforceProductionPermissions: true` in production | Startup fails closed unless queue path types, required modes, service ownership, and the root-owned draft parent are correct |
 | Humans review the actual action | The approval decision is about the concrete email payload or exact mailbox operation shown in Telegram |
 
 If you run Nightdrop and your agent as the same Unix user, or give the agent direct send credentials, Nightdrop is still useful as an approval workflow — but it is **not** a structural security boundary.
@@ -73,13 +73,13 @@ For example, Hermes approval can help decide whether a risky command should run.
 This isn't "we told the AI to be careful." It's structural:
 
 - **Process isolation** — Nightdrop runs as a separate OS user. The AI agent cannot read, modify, or delete drafts after submission.
-- **Write-only inbox** — the agent can drop files in but cannot read or list the directory (Unix dropbox permissions: `1730`).
+- **Dropbox inbox** — the agent can create a known submission but cannot enumerate the directory (Unix dropbox permissions: `1730`). The watcher opens it without following symlinks, validates a bounded snapshot, writes a new exclusive `0600` service-owned inode in private `pending/`, and only then removes the unchanged inbox entry. Retained hard links or open file descriptors cannot mutate the claimed copy.
 - **Hash-verified approvals** — a full SHA-256 hash is computed at preview time and bound to an unguessable approval nonce. If the draft is modified between preview and approval, the approval is rejected.
 - **From-address enforcement** — the `from` field in drafts is ignored. The approval preview shows the configured sender address and labels the draft `from` as ignored, preventing approval-screen spoofing.
 - **No AI in execution** — the executor reads the approved file directly. No LLM processes, summarizes, or touches the content.
 - **Out-of-band approval** — the Telegram bot has its own token and runs independently. The AI agent has no access to it.
 - **Schema validation** — [Zod](https://zod.dev) schemas enforce bounds on all fields (subject: 500 chars, body: 256KB, tags: 20 max).
-- **Symlink rejection** — only regular files are accepted via `lstat()`. Symlinks, devices, sockets, and directories are rejected.
+- **Symlink and inode-race rejection** — only bounded regular files opened with `O_NOFOLLOW` are accepted; the opened inode must match the inspected inbox entry. Symlinks, devices, sockets, directories, and path swaps are rejected.
 - **Sanitized errors** — no raw API responses or stack traces leak to Telegram or audit logs.
 
 ## Quick Start
@@ -479,7 +479,7 @@ nightdrop/
 │   ├── config.ts         # Config loader + secret resolution
 │   ├── oauth-setup.ts    # Human-only PKCE OAuth CLI (device fallback for Outlook)
 │   ├── oauth/            # PKCE, callback, provider OAuth, secure persistence
-│   ├── watcher.ts        # File watcher (inbox → pending)
+│   ├── watcher.ts        # File watcher (detached inbox capture → pending)
 │   ├── bot.ts            # Telegram bot (previews + callbacks)
 │   ├── executor.ts       # Reads approved drafts, dispatches to providers
 │   ├── schema.ts         # Zod schemas + validation
@@ -494,7 +494,7 @@ nightdrop/
 │       └── log-only.ts              # Dry-run logger
 ├── drafts/               # Draft queue directories
 │   ├── inbox/            # Public dropbox (agents write here)
-│   ├── pending/          # Internal (watcher moves files here)
+│   ├── pending/          # Internal (watcher writes detached private copies here)
 │   ├── approved/         # Human-approved
 │   ├── sent/             # Successfully executed
 │   ├── denied/           # Human-denied
